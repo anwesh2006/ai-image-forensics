@@ -29,7 +29,7 @@ st.markdown(
 # ---------------------------------------------------------
 DEVICE = "cpu"
 MODEL_PATH = "best_detector_convnext.pth"
-DRIVE_FILE_ID = "YOUR_GOOGLE_DRIVE_FILE_ID"
+DRIVE_FILE_ID = "10xEA2w3dbTFeULpCSAU8OHEU9LXgOnCC"
 
 
 def download_weights_if_missing():
