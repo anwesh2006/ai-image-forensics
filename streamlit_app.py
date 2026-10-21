@@ -31,8 +31,7 @@ DEVICE = "cpu"
 MODEL_PATH = "best_detector_convnext.pth"
 
 # Paste your Google Drive File ID here:
-# (From: https://drive.google.com/file/d/YOUR_FILE_ID_HERE/view?usp=sharing)
-DRIVE_FILE_ID = "10xEA2w3dbTFeULpCSAU8OHEU9LXgOnCC"
+DRIVE_FILE_ID = "YOUR_GOOGLE_DRIVE_FILE_ID"
 
 
 def download_weights_if_missing():
@@ -91,10 +90,10 @@ def compute_fft_spectrum(img_rgb):
 # UI Sidebar & Controls
 # ---------------------------------------------------------
 st.sidebar.header("Inference Controls")
-apply_noise_filter = st.sidebar.checkbox(
-    "Apply Sensor Noise Dampener",
+match_cifake_scale = st.sidebar.checkbox(
+    "Align with CIFAKE Resolution (32x32 -> 224x224)",
     value=True,
-    help="Recommended for external phone/web uploads to suppress high-frequency camera noise."
+    help="Matches the exact CIFAR-10 low-resolution interpolation format the model was trained on."
 )
 
 temperature = st.sidebar.slider(
@@ -110,7 +109,7 @@ st.sidebar.markdown("---")
 st.sidebar.markdown(
     "**Dataset Context:**\n"
     "Trained on CIFAKE (60,000 real CIFAR-10 images vs. 60,000 Stable Diffusion v1.4 generations). "
-    "Unseen categories (e.g. food, text, faces) may display lower certainty."
+    "Unseen categories (e.g. food, text, human faces) may display lower certainty."
 )
 
 # ---------------------------------------------------------
@@ -129,20 +128,17 @@ if uploaded_file is not None:
     # 1. Aspect-ratio preserving square crop
     cropped = center_crop(raw_rgb)
 
-    # 2. Sensor noise filtering & resizing to 224x224
-    if apply_noise_filter:
-        small = cv2.resize(cropped, (64, 64), interpolation=cv2.INTER_AREA)
-        smoothed = cv2.resize(small, (224, 224), interpolation=cv2.INTER_LINEAR)
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-        _, encimg = cv2.imencode(".jpg", cv2.cvtColor(smoothed, cv2.COLOR_RGB2BGR), encode_param)
-        resized = cv2.cvtColor(cv2.imdecode(encimg, 1), cv2.COLOR_BGR2RGB)
+    # 2. Strict CIFAKE training distribution matching (no artificial JPEG block noise)
+    if match_cifake_scale:
+        cifar_scale = cv2.resize(cropped, (32, 32), interpolation=cv2.INTER_AREA)
+        resized = cv2.resize(cifar_scale, (224, 224), interpolation=cv2.INTER_CUBIC)
     else:
-        resized = cv2.resize(cropped, (224, 224), interpolation=cv2.INTER_LINEAR)
+        resized = cv2.resize(cropped, (224, 224), interpolation=cv2.INTER_CUBIC)
 
     # 3. Normalization for ConvNeXt
     float_img = np.float32(resized) / 255.0
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
     tensor = (float_img - mean) / std
     tensor = torch.tensor(tensor, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
@@ -160,12 +156,12 @@ if uploaded_file is not None:
     cam_image = show_cam_on_image(float_img, grayscale_cam, use_rgb=True)
     fft_image = compute_fft_spectrum(resized)
 
-    # 6. Classification Verdict
-    if prob_fake >= 0.65:
+    # 6. Calibrated Thresholding (mitigates false positive synthetic bias)
+    if prob_fake >= 0.85:
         verdict = "AI-GENERATED (SYNTHETIC)"
         status_color = "red"
         confidence = prob_fake
-    elif prob_fake <= 0.35:
+    elif prob_fake <= 0.45:
         verdict = "AUTHENTIC (REAL)"
         status_color = "green"
         confidence = prob_real
