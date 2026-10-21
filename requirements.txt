@@ -5,4 +5,4 @@ timm
 grad-cam
 opencv-python-headless
 numpy
-requests
+gdown
