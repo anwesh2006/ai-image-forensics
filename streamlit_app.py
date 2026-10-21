@@ -29,16 +29,14 @@ st.markdown(
 # ---------------------------------------------------------
 DEVICE = "cpu"
 MODEL_PATH = "best_detector_convnext.pth"
-
-# Paste your Google Drive File ID here:
-DRIVE_FILE_ID = "10xEA2w3dbTFeULpCSAU8OHEU9LXgOnCC"
+DRIVE_FILE_ID = "YOUR_GOOGLE_DRIVE_FILE_ID"
 
 
 def download_weights_if_missing():
     """Downloads model weights directly from Google Drive if not present locally."""
     if not os.path.exists(MODEL_PATH):
         if DRIVE_FILE_ID == "YOUR_GOOGLE_DRIVE_FILE_ID":
-            st.error("Please replace `YOUR_GOOGLE_DRIVE_FILE_ID` in `streamlit_app.py` with your actual file ID.")
+            st.error("Please replace `YOUR_GOOGLE_DRIVE_FILE_ID` with your actual file ID.")
             st.stop()
         with st.spinner("Downloading trained model weights (~106 MB)..."):
             url = f"https://drive.google.com/uc?id={DRIVE_FILE_ID}"
@@ -67,7 +65,7 @@ targets = [BinaryClassifierOutputTarget(None)]
 # Forensics & Image Processing Helper Functions
 # ---------------------------------------------------------
 def center_crop(img):
-    """Crops the center square to preserve aspect ratio without stretching."""
+    """Crops center square to preserve aspect ratio without non-uniform stretching."""
     h, w = img.shape[:2]
     min_dim = min(h, w)
     start_x = (w - min_dim) // 2
@@ -87,33 +85,49 @@ def compute_fft_spectrum(img_rgb):
 
 
 # ---------------------------------------------------------
-# UI Sidebar & Controls
+# Sidebar Diagnostic & Tuning Controls
 # ---------------------------------------------------------
-st.sidebar.header("Inference Controls")
-match_cifake_scale = st.sidebar.checkbox(
-    "Align with CIFAKE Resolution (32x32 -> 224x224)",
-    value=True,
-    help="Matches the exact CIFAR-10 low-resolution interpolation format the model was trained on."
+st.sidebar.header("Forensics Calibration")
+
+invert_classes = st.sidebar.checkbox(
+    "Invert Prediction Polarity",
+    value=False,
+    help="Enable if your training setup treated 1 as FAKE instead of REAL."
+)
+
+resolution_mode = st.sidebar.selectbox(
+    "Input Resolution Processing",
+    options=["Native 224x224 (Preserves AI Artifacts)", "CIFAR Scale 32x32 (Dampens Camera Noise)"],
+    index=0,
+    help="Switch to Native 224x224 if synthetic images are slipping through as real."
+)
+
+detection_profile = st.sidebar.radio(
+    "Detection Sensitivity Profile",
+    options=["Balanced (Threshold 0.50)", "High AI Sensitivity (Threshold 0.35)", "High Authentic Sensitivity (Threshold 0.65)"],
+    index=0,
+    help="Lower threshold catches subtle AI generations; higher threshold demands stronger proof before flagging AI."
 )
 
 temperature = st.sidebar.slider(
-    "Temperature Calibration (T)",
+    "Logit Calibration Temperature (T)",
     min_value=1.0,
-    max_value=3.0,
-    value=2.0,
+    max_value=2.5,
+    value=1.0,
     step=0.1,
-    help="Higher values soften extreme out-of-domain confidence spikes."
+    help="Keep at 1.0 for raw training confidence. Increase only if predictions are overly aggressive."
 )
 
-st.sidebar.markdown("---")
-st.sidebar.markdown(
-    "**Dataset Context:**\n"
-    "Trained on CIFAKE (60,000 real CIFAR-10 images vs. 60,000 Stable Diffusion v1.4 generations). "
-    "Unseen categories (e.g. food, text, human faces) may display lower certainty."
-)
+# Parse selected threshold
+if "High AI Sensitivity" in detection_profile:
+    active_threshold = 0.35
+elif "High Authentic Sensitivity" in detection_profile:
+    active_threshold = 0.65
+else:
+    active_threshold = 0.50
 
 # ---------------------------------------------------------
-# Image Upload & Processing Pipeline
+# Upload & Inference Loop
 # ---------------------------------------------------------
 uploaded_file = st.file_uploader(
     "Upload an image to inspect (JPEG, PNG, WEBP)",
@@ -125,17 +139,18 @@ if uploaded_file is not None:
     raw_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     raw_rgb = cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB)
 
-    # 1. Aspect-ratio preserving square crop
+    # 1. Center crop
     cropped = center_crop(raw_rgb)
 
-    # 2. Strict CIFAKE training distribution matching (no artificial JPEG block noise)
-    if match_cifake_scale:
-        cifar_scale = cv2.resize(cropped, (32, 32), interpolation=cv2.INTER_AREA)
-        resized = cv2.resize(cifar_scale, (224, 224), interpolation=cv2.INTER_CUBIC)
+    # 2. Resizing strategy
+    if resolution_mode == "CIFAR Scale 32x32 (Dampens Camera Noise)":
+        small = cv2.resize(cropped, (32, 32), interpolation=cv2.INTER_AREA)
+        resized = cv2.resize(small, (224, 224), interpolation=cv2.INTER_CUBIC)
     else:
+        # Native direct resize preserves microscopic diffusion generator artifacts
         resized = cv2.resize(cropped, (224, 224), interpolation=cv2.INTER_CUBIC)
 
-    # 3. Normalization for ConvNeXt
+    # 3. Standard ImageNet Normalization
     float_img = np.float32(resized) / 255.0
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -143,58 +158,60 @@ if uploaded_file is not None:
     tensor = (float_img - mean) / std
     tensor = torch.tensor(tensor, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
 
-    # 4. Model Inference
+    # 4. Inference
     with torch.no_grad():
-        raw_logit = model(tensor).squeeze()
+        raw_logit = model(tensor).squeeze().item()
         calibrated_logit = raw_logit / temperature
-        # ImageFolder alphabetical sorting: 0 = FAKE, 1 = REAL
-        prob_real = torch.sigmoid(calibrated_logit).item()
-        prob_fake = 1.0 - prob_real
+        p = torch.sigmoid(torch.tensor(calibrated_logit)).item()
 
-    # 5. Explainability Map Generation
+        if invert_classes:
+            prob_fake = p
+            prob_real = 1.0 - p
+        else:
+            prob_real = p
+            prob_fake = 1.0 - p
+
+    # 5. XAI Visualizations
     grayscale_cam = cam(input_tensor=tensor, targets=targets)[0, :]
     cam_image = show_cam_on_image(float_img, grayscale_cam, use_rgb=True)
     fft_image = compute_fft_spectrum(resized)
 
-    # 6. Calibrated Thresholding (mitigates false positive synthetic bias)
-    if prob_fake >= 0.85:
+    # 6. Verdict Calculation
+    if prob_fake >= active_threshold:
         verdict = "AI-GENERATED (SYNTHETIC)"
         status_color = "red"
         confidence = prob_fake
-    elif prob_fake <= 0.45:
+    else:
         verdict = "AUTHENTIC (REAL)"
         status_color = "green"
         confidence = prob_real
-    else:
-        verdict = "UNCERTAIN / OUT-OF-DOMAIN"
-        status_color = "orange"
-        confidence = max(prob_fake, prob_real)
 
-    # ---------------------------------------------------------
-    # Render Diagnostics & Visualizations
-    # ---------------------------------------------------------
+    # Render Results
     st.markdown(f"### Verdict: :{status_color}[**{verdict}**]")
 
-    m_col1, m_col2, m_col3 = st.columns(3)
-    m_col1.metric("Confidence", f"{confidence * 100:.2f}%")
-    m_col2.metric("Synthetic Probability", f"{prob_fake:.4f}")
-    m_col3.metric("Authentic Probability", f"{prob_real:.4f}")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Confidence", f"{confidence * 100:.2f}%")
+    m2.metric("Synthetic Probability", f"{prob_fake:.4f}")
+    m3.metric("Authentic Probability", f"{prob_real:.4f}")
+    m4.metric("Raw Logit (z)", f"{raw_logit:+.2f}")
 
     st.markdown("---")
     st.subheader("Explainable AI (XAI) Forensic Evidence")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.image(resized, caption="1. Normalized Input (Center Cropped)", use_container_width=True)
-    with col2:
-        st.image(cam_image, caption="2. Grad-CAM Saliency Map", use_container_width=True)
-    with col3:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.image(resized, caption="1. Analyzed Crop (224x224)", use_container_width=True)
+    with c2:
+        st.image(cam_image, caption="2. Grad-CAM Activation Heatmap", use_container_width=True)
+    with c3:
         st.image(fft_image, caption="3. 2D FFT Frequency Spectrum", use_container_width=True)
 
-    with st.expander("Interpret Forensics Evidence"):
-        st.markdown(
-            "- **Grad-CAM Activation:** Highlights the specific spatial patches that drove the classification decision. "
-            "Generative images often trigger activations along smoothed boundaries, specular gloss, or structural anomalies.\n"
-            "- **2D FFT Spectrum:** Displays high-to-low spatial frequency distribution. Synthetic generators typically exhibit "
-            "abnormal cross-axis spikes or regular lattice grids from transposed convolution upsampling."
+    with st.expander("Diagnostics & Troubleshooting"):
+        st.write(
+            f"- **Raw Logit Interpretation:** Logit = `{raw_logit:+.4f}`. "
+            f"If an obvious AI image gives a strong positive logit (e.g. > +2.0), toggle **'Invert Prediction Polarity'** in the sidebar."
+        )
+        st.write(
+            "- If modern generators (Flux, Midjourney, SDXL) slip through as real, select **'High AI Sensitivity (Threshold 0.35)'** "
+            "because newer diffusion models produce fewer low-frequency errors than SD v1.4."
         )
